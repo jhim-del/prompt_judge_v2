@@ -1,0 +1,7 @@
+streamlit
+openai>=1.0.0
+pandas
+pypdf
+xlsxwriter
+openpyxl
+tabulate
