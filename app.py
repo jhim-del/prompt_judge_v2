@@ -9,6 +9,35 @@ import re
 from openai import AsyncOpenAI, RateLimitError
 from pypdf import PdfReader
 
+def extract_csv_dataframes(text):
+    """
+    LLM 답변 텍스트에서 CSV 블록(들)을 찾아 DataFrame 리스트로 반환
+    """
+    dfs = []
+    
+    # 1. 마크다운 코드 블록(```csv ... ```) 추출 시도
+    code_blocks = re.findall(r'```csv\s*([\s\S]*?)\s*```', text, re.IGNORECASE)
+    
+    if not code_blocks:
+        # csv 태그가 없으면 그냥 코드 블록(``` ... ```) 시도
+        code_blocks = re.findall(r'```\s*([\s\S]*?)\s*```', text)
+    
+    # 블록이 발견되면 각각 파싱
+    if code_blocks:
+        for block in code_blocks:
+            try:
+                dfs.append(pd.read_csv(io.StringIO(block.strip())))
+            except:
+                continue
+    else:
+        # 블록이 아예 없으면 전체 텍스트를 하나의 CSV로 시도
+        try:
+            dfs.append(pd.read_csv(io.StringIO(text.strip())))
+        except:
+            pass
+            
+    return dfs
+
 # ---------------------------------------------------------
 # [설정] 페이지 기본 세팅
 # ---------------------------------------------------------
@@ -154,8 +183,7 @@ async def evaluate_text_logic(client, model, target_text, user_output, task_type
 # ---------------------------------------------------------
 def evaluate_excel_data(golden_sheets, user_output_text):
     """
-    Python Pandas를 이용한 데이터 정밀 비교
-    user_output_text는 LLM이 생성한 CSV 형태의 텍스트라고 가정
+    [수정됨] 멀티 시트 지원 평가 로직
     """
     score = 0
     feedback = []
@@ -163,52 +191,78 @@ def evaluate_excel_data(golden_sheets, user_output_text):
     if not golden_sheets:
         return {"score": 0, "feedback": "정답(Golden) 엑셀 파일이 없습니다."}
 
-    try:
-        # LLM 출력을 DataFrame으로 변환 시도 (간이 파싱)
-        # 실제로는 LLM이 코드블록(csv) 등을 포함할 수 있으므로 정제 필요
-        clean_csv = re.sub(r'```csv|```', '', user_output_text).strip()
-        
-        try:
-            user_df = pd.read_csv(io.StringIO(clean_csv))
-        except:
-            return {"score": 0, "feedback": "형식 오류: CSV로 변환할 수 없는 출력입니다."}
+    # 1. 사용자 답변에서 DataFrame들 추출
+    user_dfs = extract_csv_dataframes(user_output_text)
+    
+    if not user_dfs:
+        return {"score": 0, "feedback": "형식 오류: CSV 데이터를 추출할 수 없습니다. (마크다운이나 쉼표 구분 형식을 지켜주세요)"}
 
-        # Sheet 1 (정제 데이터) 비교 (Golden의 첫번째 시트와 비교)
-        gold_df = list(golden_sheets.values())[0]
+    # 2. 정답 시트 준비
+    gold_sheet_names = list(golden_sheets.keys())
+    gold_dfs = list(golden_sheets.values())
+    
+    # 평가 루프
+    matched_sheets = 0
+    
+    # 최대 2개 시트까지만 평가 (Sheet1: 데이터, Sheet2: 집계)
+    max_checks = min(len(gold_dfs), 2)
+    
+    for i in range(max_checks):
+        g_name = gold_sheet_names[i]
+        g_df = gold_dfs[i]
         
-        # 1. 행 개수 비교 (삭제 로직 확인)
-        if len(user_df) == len(gold_df):
-            score += 30
-            feedback.append("행 개수 일치 (+30)")
+        # 사용자가 생성한 표가 부족하면 스킵
+        if i >= len(user_dfs):
+            feedback.append(f"[{g_name}] 누락됨 (-50)")
+            continue
+            
+        u_df = user_dfs[i]
+        
+        # --- 개별 시트 채점 로직 ---
+        sheet_score = 0
+        sheet_feedback = []
+        
+        # 1) 컬럼명 비교 (유사도 체크)
+        g_cols = set(g_df.columns)
+        u_cols = set(u_df.columns)
+        common_cols = g_cols.intersection(u_cols)
+        
+        if len(common_cols) / len(g_cols) >= 0.5: # 컬럼이 50% 이상 일치하면 채점 진행
+            sheet_score += 20
+            
+            # 2) 행 개수 비교
+            row_diff = abs(len(g_df) - len(u_df))
+            if row_diff == 0:
+                sheet_score += 30
+                sheet_feedback.append("행 개수 정확")
+            elif row_diff < 5: # 오차 범위 허용
+                sheet_score += 15
+                sheet_feedback.append("행 개수 유사")
+            else:
+                sheet_feedback.append(f"행 개수 차이 큼(정답:{len(g_df)} vs 제출:{len(u_df)})")
+                
+            # 3) 데이터 값 정밀 비교 (간소화된 로직)
+            # 첫번째 컬럼(보통 ID나 Name)이 같은지 확인
+            try:
+                col_name = list(g_df.columns)[0]
+                if col_name in u_df.columns:
+                    match_cnt = sum(g_df[col_name].astype(str).str.strip() == u_df[col_name].astype(str).str.strip())
+                    accuracy = match_cnt / len(g_df)
+                    if accuracy > 0.8: sheet_score += 50
+                    elif accuracy > 0.5: sheet_score += 30
+                    else: sheet_feedback.append("데이터 값 불일치 다수")
+            except:
+                pass
+                
         else:
-            feedback.append(f"행 개수 불일치 (제출:{len(user_df)} vs 정답:{len(gold_df)})")
-
-        # 2. 컬럼명 비교
-        if list(user_df.columns) == list(gold_df.columns):
-            score += 20
-            feedback.append("컬럼 구조 일치 (+20)")
-        
-        # 3. 데이터 값 샘플 비교 (이름 컬럼 등)
-        try:
-            # 정렬 후 비교
-            u_sorted = user_df.sort_values(by=user_df.columns[0]).reset_index(drop=True)
-            g_sorted = gold_df.sort_values(by=gold_df.columns[0]).reset_index(drop=True)
+            sheet_feedback.append("컬럼 구조 불일치")
             
-            match_count = (u_sorted == g_sorted).sum().sum()
-            total_cells = g_sorted.size
-            accuracy = match_count / total_cells
-            
-            data_score = int(accuracy * 50) # 데이터 정확도 50점 만점
-            score += data_score
-            feedback.append(f"데이터 일치율 {accuracy:.1%} (+{data_score})")
-            
-        except:
-            feedback.append("데이터 값 비교 중 에러 (형식 차이)")
+        # 시트별 점수 합산 (최대 50점씩 배분)
+        final_sheet_score = min(sheet_score, 100) * 0.5 # 시트당 50점 만점
+        score += final_sheet_score
+        feedback.append(f"[{g_name}: {final_sheet_score}점] " + ", ".join(sheet_feedback))
 
-        return {"score": score, "feedback": ", ".join(feedback)}
-
-    except Exception as e:
-        return {"score": 0, "feedback": f"채점 중 치명적 오류: {str(e)}"}
+    return {"score": round(score), "feedback": " / ".join(feedback)}
 
 
 # ---------------------------------------------------------
